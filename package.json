@@ -1,0 +1,10 @@
+{
+  "name": "gwandam-wiki",
+  "version": "1.4.0",
+  "private": true,
+  "description": "괴담 위키 - 누구나 편집 제안, 관리자 승인 후 반영 (Cloudflare Workers + D1)",
+  "scripts": {
+    "dev": "npx wrangler dev",
+    "deploy": "npx wrangler deploy"
+  }
+}

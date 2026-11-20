@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0c110e">
+<title>괴현상관리국</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Gowun+Batang:wght@400;700&family=IBM+Plex+Sans+KR:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<a class="skip" href="#main">본문으로 건너뛰기</a>
+
+<header class="top">
+  <div class="top-in">
+    <button class="menu-btn" id="menuBtn" type="button" aria-label="메뉴 열기" aria-expanded="false" aria-controls="rail">메뉴</button>
+    <a class="brand" href="#/" aria-label="괴현상관리국 대문">
+      <span class="brand-seal" aria-hidden="true">怪</span>
+      <span class="brand-txt"><span class="brand-name">괴현상관리국</span><span class="brand-sub">괴담 감시·격리·연구</span></span>
+    </a>
+    <form class="search" id="sform" role="search">
+      <input id="q" type="search" placeholder="제목이나 내용으로 찾기" aria-label="괴담 검색" autocomplete="off">
+      <button type="submit">찾기</button>
+    </form>
+  </div>
+</header>
+
+<div class="shell">
+  <aside class="rail" id="rail" aria-label="메뉴"></aside>
+  <main id="main" tabindex="-1"></main>
+</div>
+
+<footer class="foot">누구나 편집을 제안할 수 있고, 관리자가 승인한 내용만 문서에 남습니다.</footer>
+<div id="toasts" aria-live="polite"></div>
+<script src="/app.js"></script>
+</body>
+</html>

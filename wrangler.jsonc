@@ -1,0 +1,17 @@
+{
+  "name": "gwandam-wiki",
+  "main": "src/worker.js",
+  "compatibility_date": "2025-03-01",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": ["/api/*"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "gwandam-wiki-db",
+      "database_id": "af214142-d534-45b5-92af-222bd93a0bff"
+    }
+  ]
+}
