@@ -1,8 +1,8 @@
-// 괴현상관리국 v1.4.0 - Cloudflare Workers + D1
+// 괴현상관리국 v1.5.0 - Cloudflare Workers + D1
 // - 누구나 문서 작성/수정 "제안"을 보낼 수 있고, 관리자가 승인해야 문서에 반영됩니다.
 // - 정적 파일(public/)은 Workers Assets가, /api/* 는 이 파일이 처리합니다.
 
-const VERSION = '1.4.0';
+const VERSION = '1.5.0';
 // v1.3.0부터 분류 기능은 없습니다. 이미 만들어진 DB의 category 열과 호환되도록 열은 남겨두고 항상 이 값만 넣습니다.
 const NO_CATEGORY = '기타';
 const MAX_TITLE = 80;
@@ -10,6 +10,13 @@ const MAX_CONTENT = 50000;
 const MAX_PENDING = 500;
 const MAX_BODY = 200 * 1024;
 const IMPORT_MAX_BODY = 8 * 1024 * 1024; // 백업 복원 파일 최대 크기
+const IMPORT_MAX_WITNESS = 500;
+const MAX_WITNESS = 500;          // 목격담 한 건 최대 글자 수
+const MAX_WITNESS_PENDING = 300;
+const SYSTEM_TITLES = ['대문', '도움말'];
+const STRIKE_LIMIT = 3;           // 이만큼 반려되면 제한
+const STRIKE_WINDOW = 7 * 24 * 3600 * 1000;
+const BLOCK_STEP = 24 * 3600 * 1000;
 const IMPORT_MAX_PAGES = 500;            // 한 번에 복원할 수 있는 문서 수
 const MAX_REVISIONS = 200;
 const MAX_DONE_PROPOSALS = 300;
@@ -60,6 +67,31 @@ const SCHEMA = [
     title TEXT NOT NULL,
     who TEXT NOT NULL,
     PRIMARY KEY (title, who)
+  )`,
+  `CREATE TABLE IF NOT EXISTS meta (
+    title TEXT PRIMARY KEY,
+    no INTEGER NOT NULL,
+    grade INTEGER NOT NULL DEFAULT 0
+  )`,
+  `CREATE TABLE IF NOT EXISTS witness (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    author TEXT NOT NULL,
+    who TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_wit_title ON witness(title, status)`,
+  `CREATE TABLE IF NOT EXISTS strikes (
+    who TEXT PRIMARY KEY,
+    count INTEGER NOT NULL,
+    until INTEGER NOT NULL,
+    last_at INTEGER NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS prop_who (
+    prop_id INTEGER PRIMARY KEY,
+    who TEXT NOT NULL
   )`
 ];
 
@@ -221,6 +253,11 @@ function applyStmts(env, d, now, trim = true) {
          content=excluded.content, updated_at=excluded.updated_at`
     ).bind(d.title, NO_CATEGORY, d.scare, d.content, now)
   ];
+  if (!SYSTEM_TITLES.includes(d.title)) {
+    stmts.push(env.DB.prepare(
+      'INSERT OR IGNORE INTO meta(title,no,grade) SELECT ?, COALESCE(MAX(no),0)+1, 0 FROM meta'
+    ).bind(d.title));
+  }
   if (trim) {
     stmts.push(env.DB.prepare(
       'DELETE FROM revisions WHERE title=? AND id NOT IN (SELECT id FROM revisions WHERE title=? ORDER BY id DESC LIMIT ?)'
@@ -245,6 +282,43 @@ function makeExcerpt(text) {
     .replace(/\*\*(.+?)\*\*/g, '$1')
     .replace(/`/g, '');
   return s.length > 110 ? s.slice(0, 110).trim() + '…' : s;
+}
+
+// ---------- 제안 제한 (반려가 반복되면 일정 시간 제안을 막음) ----------
+async function whoKey(env, request) {
+  return sha256Hex(clientIp(request) + '|who|' + (env.ADMIN_PASSWORD || ''));
+}
+async function checkBlocked(env, who) {
+  const row = await env.DB.prepare('SELECT until FROM strikes WHERE who=?').bind(who).first();
+  if (row && row.until > Date.now()) {
+    const h = Math.max(1, Math.ceil((row.until - Date.now()) / 3600000));
+    throw new HttpError(403, `반려가 반복되어 약 ${h}시간 동안 제안과 목격담을 보낼 수 없습니다.`);
+  }
+}
+async function recordStrike(env, who) {
+  if (!who) return;
+  const now = Date.now();
+  const row = await env.DB.prepare('SELECT count, until, last_at FROM strikes WHERE who=?').bind(who).first();
+  const count = row && row.last_at > now - STRIKE_WINDOW ? row.count + 1 : 1;
+  let until = row ? row.until : 0;
+  if (count >= STRIKE_LIMIT) until = now + Math.min(7, count - STRIKE_LIMIT + 1) * BLOCK_STEP;
+  await env.DB.prepare('INSERT OR REPLACE INTO strikes(who,count,until,last_at) VALUES(?,?,?,?)').bind(who, count, until, now).run();
+}
+async function recordGood(env, who) {
+  if (!who) return;
+  await env.DB.prepare('UPDATE strikes SET count=MAX(count-1,0) WHERE who=?').bind(who).run();
+}
+
+function notifyHook(c, text) {
+  const url = c.env.NOTIFY_WEBHOOK_URL;
+  if (!url || !/^https?:\/\//.test(url)) return;
+  text = text.slice(0, 1800);
+  const job = fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ username: '괴현상관리국', content: text, text, allowed_mentions: { parse: [] } })
+  }).catch(() => {});
+  if (c.ctx && c.ctx.waitUntil) c.ctx.waitUntil(job);
 }
 
 // 새 제안 알림 (NOTIFY_WEBHOOK_URL 이 설정돼 있을 때만, Discord 웹훅 형식)
@@ -281,6 +355,13 @@ function init(env) {
         await env.DB.batch(stmts);
       }
       await env.DB.prepare('DELETE FROM ratelimit WHERE reset_at < ?').bind(Date.now()).run();
+      // 예전 문서(번호가 없는 문서)에 만든 순서대로 번호를 붙입니다.
+      await env.DB.prepare(
+        `INSERT INTO meta(title,no,grade)
+         SELECT title, (SELECT COALESCE(MAX(no),0) FROM meta) + ROW_NUMBER() OVER (ORDER BY (SELECT MIN(id) FROM revisions r WHERE r.title = pages.title), title), 0
+         FROM pages WHERE title NOT IN ('대문','도움말') AND title NOT IN (SELECT title FROM meta)`
+      ).run();
+      await env.DB.prepare('DELETE FROM prop_who WHERE prop_id NOT IN (SELECT id FROM proposals)').run();
     })().catch(e => { initPromise = null; throw e; });
   }
   return initPromise;
@@ -310,6 +391,7 @@ route('GET', '/api/info', false, async c => {
   };
   if (c.admin) {
     out.pending = (await c.env.DB.prepare("SELECT COUNT(*) AS n FROM proposals WHERE status='pending'").first()).n;
+    out.witnessPending = (await c.env.DB.prepare("SELECT COUNT(*) AS n FROM witness WHERE status='pending'").first()).n;
   }
   return json(out);
 });
@@ -333,7 +415,7 @@ route('POST', '/api/admin/login', false, async c => {
 });
 
 route('GET', '/api/pages', false, async c => {
-  const { results } = await c.env.DB.prepare('SELECT title, scare, updated_at AS updatedAt, (SELECT COUNT(*) FROM reactions r WHERE r.title = pages.title) AS reactions FROM pages').all();
+  const { results } = await c.env.DB.prepare('SELECT title, scare, updated_at AS updatedAt, (SELECT COUNT(*) FROM reactions r WHERE r.title = pages.title) AS reactions, (SELECT no FROM meta m WHERE m.title = pages.title) AS no, (SELECT grade FROM meta m WHERE m.title = pages.title) AS grade FROM pages').all();
   results.sort((a, b) => a.title.localeCompare(b.title, 'ko'));
   return json(results);
 });
@@ -380,13 +462,18 @@ route('GET', '/api/pages/:title', false, async c => {
   const p = await db.prepare('SELECT title, scare, content, updated_at, (SELECT COUNT(*) FROM reactions r WHERE r.title = pages.title) AS reactions FROM pages WHERE title=?').bind(title).first();
   if (!p) return json({ error: '문서가 없습니다.', pending }, 404);
   const revCount = (await db.prepare('SELECT COUNT(*) AS n FROM revisions WHERE title=?').bind(title).first()).n;
+  const mt = await db.prepare('SELECT no, grade FROM meta WHERE title=?').bind(title).first();
+  const { results: wit } = await db.prepare(
+    "SELECT id, author, content, created_at AS createdAt FROM witness WHERE title=? AND status='approved' ORDER BY id LIMIT 100"
+  ).bind(title).all();
   const t = escLike(title);
   const { results: bl } = await db.prepare(
     `SELECT title FROM pages WHERE title != ? AND (content LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\') ORDER BY title LIMIT 50`
   ).bind(title, '%[[' + t + ']]%', '%[[' + t + '|%').all();
   return json({
     title: p.title, scare: p.scare, content: p.content,
-    updatedAt: p.updated_at, revCount, pending, reactions: p.reactions, backlinks: bl.map(x => x.title)
+    updatedAt: p.updated_at, revCount, pending, reactions: p.reactions,
+    no: mt ? mt.no : 0, grade: mt ? mt.grade : 0, witnesses: wit, backlinks: bl.map(x => x.title)
   });
 });
 
@@ -416,6 +503,8 @@ route('POST', '/api/proposals', false, async c => {
   if ((await rateHit(c.env, 'p:' + ip, 60 * 1000)) > 5) {
     throw new HttpError(429, '제안을 너무 자주 보내고 있습니다. 1분 뒤에 다시 보내주세요.');
   }
+  const who = await whoKey(c.env, c.request);
+  await checkBlocked(c.env, who);
   const b = await readJson(c.request);
   await verifyTurnstile(c.request, c.env, b.turnstile);
   const title = cleanTitle(b.title);
@@ -440,6 +529,7 @@ route('POST', '/api/proposals', false, async c => {
     `INSERT INTO proposals(title,content,category,scare,author,summary,is_new,base_rev,created_at,status)
      VALUES(?,?,?,?,?,?,?,?,?, 'pending')`
   ).bind(title, content, NO_CATEGORY, scare, cleanAuthor(b.author), String(b.summary || '').trim().slice(0, 100), existing ? 0 : 1, baseRev, Date.now()).run();
+  await db.prepare('INSERT OR REPLACE INTO prop_who(prop_id, who) VALUES(?,?)').bind(res.meta.last_row_id, who).run();
   notifyNewProposal(c, res.meta.last_row_id, title, !existing, cleanAuthor(b.author));
   return json({ ok: true, id: res.meta.last_row_id });
 });
@@ -477,6 +567,13 @@ route('GET', '/api/proposals', true, async c => {
        WHERE pr.status = 'pending' ORDER BY pr.id DESC LIMIT 100`
     ).all());
     results.forEach(r => { r.outdated = r.curContent != null && (r.lastRev || 0) !== r.baseRev; });
+    // 충돌 합치기에 쓸, 제안을 쓸 때 기준이 된 판의 내용
+    const ids = [...new Set(results.filter(r => r.outdated && r.baseRev).map(r => r.baseRev))];
+    if (ids.length) {
+      const { results: bs } = await db.prepare(`SELECT id, content FROM revisions WHERE id IN (${ids.map(() => '?').join(',')})`).bind(...ids).all();
+      const m = new Map(bs.map(x => [x.id, x.content]));
+      results.forEach(r => { if (r.outdated) r.baseContent = m.has(r.baseRev) ? m.get(r.baseRev) : null; });
+    }
   }
   return json(results);
 });
@@ -506,6 +603,8 @@ route('POST', '/api/proposals/:id/approve', true, async c => {
     db.prepare("UPDATE proposals SET status='approved', decided_at=? WHERE id=?").bind(now, id),
     trimProposalsStmt(c.env)
   ]);
+  const w = await db.prepare('SELECT who FROM prop_who WHERE prop_id=?').bind(id).first();
+  if (w) await recordGood(c.env, w.who);
   return json({ ok: true });
 });
 
@@ -518,6 +617,10 @@ route('POST', '/api/proposals/:id/reject', true, async c => {
     .bind(Date.now(), reason, id).run();
   if (!res.meta.changes) throw new HttpError(404, '대기 중인 제안이 없습니다. 이미 처리됐을 수 있습니다.');
   await trimProposalsStmt(c.env).run();
+  if (b.strike !== false) {
+    const w = await db.prepare('SELECT who FROM prop_who WHERE prop_id=?').bind(id).first();
+    if (w) await recordStrike(c.env, w.who);
+  }
   return json({ ok: true });
 });
 
@@ -532,6 +635,90 @@ route('PUT', '/api/pages/:title', true, async c => {
     title, content, scare: cleanScare(b.scare),
     author: '관리자', summary: String(b.summary || '').trim().slice(0, 100) || '관리자 편집'
   }, Date.now()));
+  return json({ ok: true });
+});
+
+// 격리 등급 지정 (관리자): 0 미지정, 1 안전, 2 주의, 3 위험, 4 봉인
+route('PUT', '/api/pages/:title/grade', true, async c => {
+  const title = cleanTitle(c.params.title);
+  const b = await readJson(c.request);
+  const grade = Number(b.grade);
+  if (!Number.isInteger(grade) || grade < 0 || grade > 4) throw new HttpError(400, '등급 값이 올바르지 않습니다.');
+  if (SYSTEM_TITLES.includes(title)) throw new HttpError(400, '이 문서에는 등급을 지정할 수 없습니다.');
+  const exists = await c.env.DB.prepare('SELECT 1 AS x FROM pages WHERE title=?').bind(title).first();
+  if (!exists) throw new HttpError(404, '문서가 없습니다.');
+  await c.env.DB.batch([
+    c.env.DB.prepare('INSERT OR IGNORE INTO meta(title,no,grade) SELECT ?, COALESCE(MAX(no),0)+1, 0 FROM meta').bind(title),
+    c.env.DB.prepare('UPDATE meta SET grade=? WHERE title=?').bind(grade, title)
+  ]);
+  return json({ ok: true });
+});
+
+// 목격담: 누구나 남길 수 있고 관리자가 승인하면 문서 아래에 보입니다.
+route('POST', '/api/pages/:title/witness', false, async c => {
+  const db = c.env.DB;
+  const title = cleanTitle(c.params.title);
+  const ip = clientIp(c.request);
+  if ((await rateHit(c.env, 'w:' + ip, 60 * 1000)) > 3) throw new HttpError(429, '너무 자주 보내고 있습니다. 1분 뒤에 다시 보내주세요.');
+  const who = await whoKey(c.env, c.request);
+  await checkBlocked(c.env, who);
+  const b = await readJson(c.request);
+  await verifyTurnstile(c.request, c.env, b.turnstile);
+  const content = String(b.content || '').replace(/\r/g, '').trim();
+  if (content.length < 5) throw new HttpError(400, '목격담을 5자 이상 써주세요.');
+  if (content.length > MAX_WITNESS) throw new HttpError(400, `목격담은 ${MAX_WITNESS}자까지 쓸 수 있습니다.`);
+  const exists = await db.prepare('SELECT 1 AS x FROM pages WHERE title=?').bind(title).first();
+  if (!exists) throw new HttpError(404, '문서가 없습니다.');
+  const pend = (await db.prepare("SELECT COUNT(*) AS n FROM witness WHERE status='pending'").first()).n;
+  if (pend >= MAX_WITNESS_PENDING) throw new HttpError(503, '대기 중인 목격담이 너무 많습니다. 잠시 뒤에 다시 보내주세요.');
+  const author = cleanAuthor(b.author);
+  const res = await db.prepare('INSERT INTO witness(title,content,author,who,created_at,status) VALUES(?,?,?,?,?,\'pending\')')
+    .bind(title, content, author, who, Date.now()).run();
+  notifyHook(c, `새 목격담 #${res.meta.last_row_id}: 「${title}」 (${author})\n확인하러 가기: ${new URL(c.request.url).origin}/#/admin/witness`);
+  return json({ ok: true });
+});
+
+route('GET', '/api/witness', true, async c => {
+  const { results } = await c.env.DB.prepare(
+    "SELECT id, title, content, author, created_at AS createdAt FROM witness WHERE status='pending' ORDER BY id DESC LIMIT 100"
+  ).all();
+  return json(results);
+});
+route('POST', '/api/witness/:id/approve', true, async c => {
+  const id = Number(c.params.id);
+  const w = await c.env.DB.prepare("SELECT who FROM witness WHERE id=? AND status='pending'").bind(id).first();
+  if (!w) throw new HttpError(404, '대기 중인 목격담이 없습니다. 이미 처리됐을 수 있습니다.');
+  await c.env.DB.prepare("UPDATE witness SET status='approved' WHERE id=?").bind(id).run();
+  await recordGood(c.env, w.who);
+  return json({ ok: true });
+});
+route('POST', '/api/witness/:id/reject', true, async c => {
+  const id = Number(c.params.id);
+  const b = await readJson(c.request);
+  const w = await c.env.DB.prepare("SELECT who FROM witness WHERE id=? AND status='pending'").bind(id).first();
+  if (!w) throw new HttpError(404, '대기 중인 목격담이 없습니다. 이미 처리됐을 수 있습니다.');
+  await c.env.DB.prepare('DELETE FROM witness WHERE id=?').bind(id).run();
+  if (b.strike !== false) await recordStrike(c.env, w.who);
+  return json({ ok: true });
+});
+route('DELETE', '/api/witness/:id', true, async c => {
+  const res = await c.env.DB.prepare("DELETE FROM witness WHERE id=? AND status='approved'").bind(Number(c.params.id)).run();
+  if (!res.meta.changes) throw new HttpError(404, '목격담이 없습니다.');
+  return json({ ok: true });
+});
+
+// 제안 제한 목록과 해제 (관리자)
+route('GET', '/api/admin/blocks', true, async c => {
+  const { results } = await c.env.DB.prepare(
+    'SELECT substr(who,1,8) AS id, count, until FROM strikes WHERE until > ? ORDER BY until DESC LIMIT 100'
+  ).bind(Date.now()).all();
+  return json(results);
+});
+route('POST', '/api/admin/blocks/release', true, async c => {
+  const b = await readJson(c.request);
+  const id = String(b.id || '');
+  if (!/^[0-9a-f]{8}$/.test(id)) throw new HttpError(400, '올바르지 않은 값입니다.');
+  await c.env.DB.prepare('UPDATE strikes SET until=0, count=0 WHERE substr(who,1,8)=?').bind(id).run();
   return json({ ok: true });
 });
 
@@ -564,15 +751,22 @@ route('POST', '/api/pages/:title/react', false, async c => {
 route('GET', '/api/admin/export', true, async c => {
   const db = c.env.DB;
   const withRev = c.url.searchParams.get('revisions') === '1';
-  const { results: pages } = await db.prepare('SELECT title, scare, content, updated_at AS updatedAt FROM pages ORDER BY title').all();
+  const { results: pages } = await db.prepare(
+    `SELECT p.title, p.scare, p.content, p.updated_at AS updatedAt, m.no AS no, COALESCE(m.grade,0) AS grade
+     FROM pages p LEFT JOIN meta m ON m.title = p.title ORDER BY p.title`
+  ).all();
   const byTitle = {};
   if (withRev) {
     const { results } = await db.prepare('SELECT title, author, summary, at, scare, content FROM revisions ORDER BY id').all();
     for (const r of results) (byTitle[r.title] = byTitle[r.title] || []).push({ author: r.author, summary: r.summary, at: r.at, scare: r.scare, content: r.content });
   }
+  const { results: witnesses } = await db.prepare(
+    "SELECT title, author, content, created_at AS createdAt FROM witness WHERE status='approved' ORDER BY id"
+  ).all();
   return json({
     app: 'gwandam-wiki', version: VERSION, exportedAt: Date.now(),
-    pages: pages.map(p => withRev ? Object.assign({}, p, { revisions: byTitle[p.title] || [] }) : p)
+    pages: pages.map(p => withRev ? Object.assign({}, p, { revisions: byTitle[p.title] || [] }) : p),
+    witnesses
   });
 });
 
@@ -582,8 +776,11 @@ route('POST', '/api/admin/import', true, async c => {
   const b = await readJson(c.request, IMPORT_MAX_BODY);
   if (!b || b.app !== 'gwandam-wiki' || !Array.isArray(b.pages)) throw new HttpError(400, '괴현상관리국 백업 파일이 아닙니다.');
   if (b.pages.length > IMPORT_MAX_PAGES) throw new HttpError(400, `한 번에 ${IMPORT_MAX_PAGES}개 문서까지 복원할 수 있습니다.`);
-  const { results: cur } = await db.prepare('SELECT title, content, scare FROM pages').all();
+  const { results: cur } = await db.prepare(
+    'SELECT p.title, p.content, p.scare, COALESCE(m.grade,0) AS grade FROM pages p LEFT JOIN meta m ON m.title = p.title'
+  ).all();
   const have = new Map(cur.map(r => [r.title, r]));
+  const known = new Set(cur.map(r => r.title));
   const seen = new Set();
   const stmts = [];
   const now = Date.now();
@@ -594,13 +791,40 @@ route('POST', '/api/admin/import', true, async c => {
     if (!title || seen.has(title) || !content.trim() || content.length > MAX_CONTENT) { invalid++; continue; }
     seen.add(title);
     const scare = cleanScare(p.scare);
+    const grade = Number.isInteger(p.grade) && p.grade >= 0 && p.grade <= 4 ? p.grade : 0;
     const ex = have.get(title);
-    if (ex && ex.content === content && ex.scare === scare) { skipped++; continue; }
-    stmts.push(...applyStmts(c.env, { title, content, scare, author: '복원', summary: '백업에서 복원' }, now, false));
+    if (ex && ex.content === content && ex.scare === scare && ex.grade === grade) { skipped++; continue; }
+    known.add(title);
+    const sys = SYSTEM_TITLES.includes(title);
+    if (!sys && Number.isInteger(p.no) && p.no > 0) {
+      stmts.push(db.prepare('INSERT OR IGNORE INTO meta(title,no,grade) VALUES(?,?,0)').bind(title, p.no));
+    }
+    if (!ex || ex.content !== content || ex.scare !== scare) {
+      stmts.push(...applyStmts(c.env, { title, content, scare, author: '복원', summary: '백업에서 복원' }, now, false));
+    }
+    if (!sys && grade !== (ex ? ex.grade : 0)) stmts.push(db.prepare('UPDATE meta SET grade=? WHERE title=?').bind(grade, title));
     imported++;
   }
+  // 목격담: 같은 글이 이미 있으면 건너뜁니다.
+  let witAdded = 0;
+  const wl = Array.isArray(b.witnesses) ? b.witnesses.slice(0, IMPORT_MAX_WITNESS) : [];
+  if (wl.length) {
+    const { results: ws } = await db.prepare("SELECT title, content, created_at AS at FROM witness WHERE status='approved'").all();
+    const wHave = new Set(ws.map(w => w.title + '\n' + w.at + '\n' + w.content));
+    for (const w of wl) {
+      const title = cleanTitle(w && w.title);
+      const content = String((w && w.content) || '').replace(/\r/g, '').trim().slice(0, MAX_WITNESS);
+      const at = Number(w && w.createdAt) || now;
+      if (!title || !known.has(title) || content.length < 5) continue;
+      const key = title + '\n' + at + '\n' + content;
+      if (wHave.has(key)) continue;
+      wHave.add(key);
+      stmts.push(db.prepare("INSERT INTO witness(title,content,author,who,created_at,status) VALUES(?,?,?,'',?, 'approved')").bind(title, content, cleanAuthor(w.author), at));
+      witAdded++;
+    }
+  }
   for (let i = 0; i < stmts.length; i += 100) await db.batch(stmts.slice(i, i + 100));
-  return json({ ok: true, imported, skipped, invalid });
+  return json({ ok: true, imported, skipped, invalid, witnesses: witAdded });
 });
 
 route('DELETE', '/api/pages/:title', true, async c => {
@@ -611,7 +835,9 @@ route('DELETE', '/api/pages/:title', true, async c => {
   await c.env.DB.batch([
     c.env.DB.prepare('DELETE FROM pages WHERE title=?').bind(title),
     c.env.DB.prepare('DELETE FROM revisions WHERE title=?').bind(title),
-    c.env.DB.prepare('DELETE FROM reactions WHERE title=?').bind(title)
+    c.env.DB.prepare('DELETE FROM reactions WHERE title=?').bind(title),
+    c.env.DB.prepare('DELETE FROM meta WHERE title=?').bind(title),
+    c.env.DB.prepare('DELETE FROM witness WHERE title=?').bind(title)
   ]);
   return json({ ok: true });
 });

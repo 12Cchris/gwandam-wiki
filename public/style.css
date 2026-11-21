@@ -1,4 +1,4 @@
-/* 괴현상관리국 v1.4.0
+/* 괴현상관리국 v1.5.0
    방향: 형광등 아래 낡은 서류 보관함. 초록빛 도는 먹색 바탕에 붉은 승인 도장이 유일한 강조. */
 :root {
   --ink: #0c110e;
@@ -269,3 +269,24 @@ details .article { font-size: 16px; padding: 10px 14px; border: 1px solid var(--
 .rc { margin-right: 10px; font-size: 12px; opacity: .75; }
 label.chk { display: flex; align-items: center; gap: 8px; margin: 10px 0 0; }
 label.chk input { width: auto; }
+
+/* v1.5.0 */
+.docno { font-family: 'IBM Plex Sans KR', sans-serif; font-size: 12px; letter-spacing: .04em; color: var(--dim); border: 1px solid var(--line2); border-radius: 3px; padding: 0 7px; line-height: 1.7; margin-left: 8px; }
+.doc-meta .docno { margin-left: 0; }
+.grade { display: inline-block; font-size: 12px; line-height: 1.7; padding: 0 8px; border-radius: 3px; border: 1px solid; margin-left: 4px; }
+.grade.g1 { color: var(--mint); border-color: var(--mint); }
+.grade.g2 { color: #d6b25e; border-color: #d6b25e; }
+.grade.g3 { color: #e0784a; border-color: #e0784a; }
+.grade.g4 { color: #fff; background: var(--seal); border-color: var(--seal); }
+.gradebox { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 10px 0; }
+.gradebox label { margin: 0; }
+.gradebox select { width: auto; }
+.witness { margin-top: 28px; padding-top: 18px; border-top: 1px solid var(--line); }
+.wit-list { list-style: none; margin: 0 0 14px; padding: 0; display: grid; gap: 10px; }
+.wit-list li { border-left: 2px solid var(--line2); padding: 2px 0 2px 14px; }
+.wit-h { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+.wit-list p, .wit-body { margin: 4px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.7; }
+button.sm { padding: 0 8px; font-size: 12px; min-height: 0; line-height: 1.8; }
+.wit-form summary { cursor: pointer; color: var(--mint); margin: 6px 0 10px; }
+.wit-form textarea { min-height: 110px; }
+.btn .badge { margin-left: 4px; }

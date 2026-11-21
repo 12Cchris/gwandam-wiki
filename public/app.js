@@ -1,4 +1,4 @@
-// 괴현상관리국 v1.4.0 - 화면 로직
+// 괴현상관리국 v1.5.0 - 화면 로직
 'use strict';
 (() => {
   const $ = (s, r = document) => r.querySelector(s);
@@ -158,6 +158,71 @@
       toc.map(t => `<li class="l${t.level}"><button type="button" class="linklike" data-goto="${t.id}">${esc(t.text)}</button></li>`).join('') +
       '</ol></nav>';
   }
+  const GRADES = ['미지정', '안전', '주의', '위험', '봉인'];
+  const gradeHtml = g => g ? `<span class="grade g${g}">${GRADES[g]}</span>` : '';
+  const docNo = n => '괴-' + String(n).padStart(4, '0');
+
+  // 세 갈래 합치기: base(제안의 기준 판), ours(현재 문서), theirs(제안). 겹치는 줄은 충돌 표시를 남깁니다.
+  function lcsHunks(A, B) {
+    const n = A.length, m = B.length;
+    let s = 0;
+    while (s < n && s < m && A[s] === B[s]) s++;
+    let ea = n, eb = m;
+    while (ea > s && eb > s && A[ea - 1] === B[eb - 1]) { ea--; eb--; }
+    const a2 = A.slice(s, ea), b2 = B.slice(s, eb), N = a2.length, M = b2.length;
+    const dp = Array.from({ length: N + 1 }, () => new Uint32Array(M + 1));
+    for (let i = N - 1; i >= 0; i--) {
+      for (let j = M - 1; j >= 0; j--) dp[i][j] = a2[i] === b2[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+    const hunks = [];
+    let i = 0, j = 0, cur = null;
+    while (i < N || j < M) {
+      if (i < N && j < M && a2[i] === b2[j]) { if (cur) { hunks.push(cur); cur = null; } i++; j++; continue; }
+      if (!cur) cur = { as: s + i, bs: s + j, ae: 0, be: 0 };
+      if (j >= M || (i < N && dp[i + 1][j] >= dp[i][j + 1])) i++; else j++;
+      cur.ae = s + i; cur.be = s + j;
+    }
+    if (cur) hunks.push(cur);
+    return hunks;
+  }
+  function merge3(baseT, oursT, theirsT) {
+    const sp = t => t === '' ? [] : t.split('\n');
+    const base = sp(baseT), ours = sp(oursT), theirs = sp(theirsT);
+    if (base.length * Math.max(ours.length, theirs.length) > 4000000) return null;
+    const hs = [];
+    lcsHunks(base, ours).forEach(h => hs.push(Object.assign(h, { side: 'o' })));
+    lcsHunks(base, theirs).forEach(h => hs.push(Object.assign(h, { side: 't' })));
+    hs.sort((a, b) => a.as - b.as || a.ae - b.ae);
+    const out = [];
+    let pos = 0, conflicts = 0, k = 0;
+    while (k < hs.length) {
+      const grp = [hs[k++]];
+      let ge = grp[0].ae;
+      const gs = grp[0].as;
+      while (k < hs.length && hs[k].as <= ge) { ge = Math.max(ge, hs[k].ae); grp.push(hs[k++]); }
+      for (; pos < gs; pos++) out.push(base[pos]);
+      const side = (tag, other) => {
+        const r = [];
+        let q = gs;
+        for (const h of grp.filter(x => x.side === tag)) {
+          for (; q < h.as; q++) r.push(base[q]);
+          for (let x = h.bs; x < h.be; x++) r.push(other[x]);
+          q = h.ae;
+        }
+        for (; q < ge; q++) r.push(base[q]);
+        return r;
+      };
+      const O = side('o', ours), T = side('t', theirs), B = base.slice(gs, ge);
+      const same = (x, y) => x.length === y.length && x.every((v, i) => v === y[i]);
+      if (same(O, B)) out.push(...T);
+      else if (same(T, B) || same(O, T)) out.push(...O);
+      else { conflicts++; out.push('<<<<<<< 현재 문서', ...O, '=======', ...T, '>>>>>>> 제안'); }
+      pos = ge;
+    }
+    for (; pos < base.length; pos++) out.push(base[pos]);
+    return { text: out.join('\n'), conflicts };
+  }
+
   function scareHtml(n) {
     n = +n || 0;
     if (!n) return '';
@@ -241,7 +306,7 @@
        <a href="#/new" class="${active === 'new' ? 'on' : ''}">새 괴담 제안</a>
        <a href="#/mine" class="${active === 'mine' ? 'on' : ''}">내 제안</a>
        <a href="#/w/${enc('도움말')}">글쓰기 도움말</a>
-       <a href="#/admin" class="${active === 'admin' ? 'on' : ''}"><span>${info.admin ? '승인 대기' : '관리자'}</span>${info.admin && info.pending ? `<span class="badge">${info.pending}</span>` : ''}</a>
+       <a href="#/admin" class="${active === 'admin' ? 'on' : ''}"><span>${info.admin ? '승인 대기' : '관리자'}</span>${info.admin && (info.pending + (info.witnessPending || 0)) ? `<span class="badge">${info.pending + (info.witnessPending || 0)}</span>` : ''}</a>
        <div class="rail-ver">v${esc(info.version)}</div>`;
   }
 
@@ -276,6 +341,59 @@
        <div class="r">${esc(r.author || '')} ${ago(r.updatedAt)}</div></li>`).join('')}</ul>`;
   }
 
+  // ---------- 목격담 ----------
+  function witnessHtml(p) {
+    const list = p.witnesses || [];
+    return `<section class="witness"><h2 class="sec-t">목격담 ${list.length ? `(${list.length})` : ''}</h2>
+      ${list.length ? `<ul class="wit-list">${list.map(w =>
+        `<li><div class="wit-h"><b>${esc(w.author)}</b><span class="meta">${ago(w.createdAt)}</span>${info.admin ? `<button type="button" class="danger sm" data-wdel="${w.id}">삭제</button>` : ''}</div><p>${esc(w.content)}</p></li>`).join('')}</ul>`
+        : '<p class="meta">아직 접수된 목격담이 없습니다.</p>'}
+      <details class="wit-form"><summary>이 괴담을 겪었거나 들은 적이 있나요?</summary>
+        <div id="wmsg"></div>
+        <label for="wtxt">목격담 (500자까지, 관리자가 확인한 뒤 표시됩니다)</label>
+        <textarea id="wtxt" maxlength="500"></textarea>
+        <label for="wa">닉네임 (비워두면 익명)</label><input type="text" id="wa" maxlength="20" value="${esc(lsGet('nick') || '')}">
+        ${info.turnstileSiteKey ? '<div id="wsBox" class="tsbox"></div>' : ''}
+        <div class="row mt"><button type="button" class="primary" id="wsend">목격담 보내기</button></div>
+      </details></section>`;
+  }
+  function bindWitness(title) {
+    $$('[data-wdel]').forEach(b => b.onclick = async () => {
+      if (!confirm('이 목격담을 삭제할까요?')) return;
+      try { await api('/api/witness/' + b.dataset.wdel, { method: 'DELETE' }); toast('삭제했습니다.'); viewPage(title); }
+      catch (e) { toast(e.message, 'err'); }
+    });
+    const send = $('#wsend');
+    if (!send) return;
+    let tsId = null;
+    const det = $('.wit-form');
+    if (info.turnstileSiteKey) {
+      det.addEventListener('toggle', () => {
+        if (!det.open || tsId !== null) return;
+        loadTurnstile().then(() => {
+          if (!$('#wsBox') || tsId !== null) return;
+          tsId = window.turnstile.render('#wsBox', { sitekey: info.turnstileSiteKey, theme: 'dark', language: 'ko' });
+        }).catch(e => { const m = $('#wmsg'); if (m) m.innerHTML = note('err', esc(e.message)); });
+      });
+    }
+    send.onclick = async () => {
+      const body = { content: $('#wtxt').value, author: $('#wa').value };
+      if (info.turnstileSiteKey) {
+        body.turnstile = window.turnstile && tsId !== null ? window.turnstile.getResponse(tsId) : '';
+        if (!body.turnstile) { $('#wmsg').innerHTML = note('err', '"로봇이 아닙니다" 확인을 먼저 해주세요.'); return; }
+      }
+      send.disabled = true;
+      try {
+        await api('/api/pages/' + enc(title) + '/witness', { method: 'POST', body });
+        lsSet('nick', body.author);
+        $('#wtxt').value = '';
+        $('#wmsg').innerHTML = note('ok', '접수했습니다. 관리자가 확인하면 이 문서 아래에 표시됩니다.');
+      } catch (e) { $('#wmsg').innerHTML = note('err', esc(e.message)); }
+      if (window.turnstile && tsId !== null) window.turnstile.reset(tsId);
+      send.disabled = false;
+    };
+  }
+
   // ---------- 화면: 문서 ----------
   async function viewPage(title) {
     await refreshPages();
@@ -298,14 +416,23 @@
     main.innerHTML =
       `<article class="paper">
          <div class="doc-head"><h1>${esc(p.title)}</h1>${seal(false)}</div>
-         <div class="doc-meta">${scareHtml(p.scare)}
+         <div class="doc-meta">${p.no ? `<span class="docno">${docNo(p.no)}</span>` : ''}${p.grade ? `<span>격리 등급 ${gradeHtml(p.grade)}</span>` : ''}${scareHtml(p.scare)}
            <span>${fmt(p.updatedAt)} 수정</span><span>${p.revCount}개 판</span></div>
          <div class="doc-actions"><a class="btn primary" href="#/edit/${enc(p.title)}">편집 제안</a><a class="btn" href="#/history/${enc(p.title)}">변경 기록</a><button type="button" class="react" id="react">무서웠어요 <span id="rn">${p.reactions || 0}</span></button></div>
+         ${info.admin && p.no ? `<div class="gradebox"><label for="gsel">격리 등급</label><select id="gsel">${GRADES.map((g, i) => `<option value="${i}" ${i === p.grade ? 'selected' : ''}>${g}</option>`).join('')}</select><button type="button" id="gsave">등급 저장</button></div>` : ''}
          ${pending ? note('warn', `이 문서에 승인을 기다리는 편집 제안이 ${pending}건 있습니다.`) : ''}
          ${tocHtml(r.toc)}
          <div class="article">${r.html}</div>
+         ${p.no ? witnessHtml(p) : ''}
          ${back}
        </article>`;
+    if (info.admin && p.no) {
+      $('#gsave').onclick = async () => {
+        try { await api('/api/pages/' + enc(title) + '/grade', { method: 'PUT', body: { grade: +$('#gsel').value } }); toast('등급을 저장했습니다.'); await refreshPages(); viewPage(title); }
+        catch (e) { toast(e.message, 'err'); }
+      };
+    }
+    if (p.no) bindWitness(title, p);
     const rb = $('#react');
     if (lsGet('reacted:' + title)) rb.classList.add('on');
     rb.onclick = async () => {
@@ -502,16 +629,17 @@
     main.innerHTML =
       `<div class="paper"><h1>전체 문서</h1>
        <div class="tools"><input type="text" id="flt" placeholder="목록에서 제목 찾기" aria-label="목록에서 제목 찾기">
-         <select id="srt" aria-label="정렬"><option value="name">이름순</option><option value="new">최근 수정순</option><option value="scare">공포도 높은 순</option><option value="react">무서웠어요 많은 순</option></select></div>
+         <select id="srt" aria-label="정렬"><option value="name">이름순</option><option value="new">최근 수정순</option><option value="scare">공포도 높은 순</option><option value="react">무서웠어요 많은 순</option><option value="grade">격리 등급 높은 순</option></select></div>
        <div id="lst"></div></div>`;
     const draw = () => {
       const q = $('#flt').value.trim().toLowerCase(), srt = $('#srt').value;
       const l = pages.filter(p => !q || p.title.toLowerCase().includes(q));
       if (srt === 'new') l.sort((a, b) => b.updatedAt - a.updatedAt);
       else if (srt === 'scare') l.sort((a, b) => b.scare - a.scare || a.title.localeCompare(b.title, 'ko'));
+      else if (srt === 'grade') l.sort((a, b) => (b.grade || 0) - (a.grade || 0) || a.title.localeCompare(b.title, 'ko'));
       else if (srt === 'react') l.sort((a, b) => (b.reactions || 0) - (a.reactions || 0) || a.title.localeCompare(b.title, 'ko'));
       $('#lst').innerHTML = l.length
-        ? `<ul class="ledger">${l.map(p => `<li><div class="l"><a href="${wlink(p.title)}">${esc(p.title)}</a></div><div class="r">${p.reactions ? `<span class="rc">무서웠어요 ${p.reactions}</span>` : ''}${scareHtml(p.scare)}</div></li>`).join('')}</ul>`
+        ? `<ul class="ledger">${l.map(p => `<li><div class="l"><a href="${wlink(p.title)}">${esc(p.title)}</a>${p.no ? `<span class="docno">${docNo(p.no)}</span>` : ''}</div><div class="r">${gradeHtml(p.grade)}${p.reactions ? `<span class="rc">무서웠어요 ${p.reactions}</span>` : ''}${scareHtml(p.scare)}</div></li>`).join('')}</ul>`
         : '<p class="empty">맞는 문서가 없습니다. 새 괴담을 제안해보세요.</p>';
     };
     $('#flt').oninput = draw; $('#srt').onchange = draw;
@@ -559,11 +687,50 @@
   }
 
   // ---------- 화면: 관리자 ----------
+  function adminHead(title, active) {
+    const tab = (k, href, label, badge) => `<a class="btn ${active === k ? 'primary' : ''}" href="${href}">${label}${badge ? ` <span class="badge">${badge}</span>` : ''}</a>`;
+    return `<div class="paper slim"><div class="card-h"><h1>${title}</h1>
+      <div class="row">${tab('pending', '#/admin', '제안', info.pending)}${tab('witness', '#/admin/witness', '목격담', info.witnessPending)}${tab('done', '#/admin/done', '처리 내역')}${tab('blocks', '#/admin/blocks', '제한')}${tab('backup', '#/admin/backup', '백업')}<button type="button" id="logout">로그아웃</button></div></div></div>`;
+  }
+  function bindLogout() { $('#logout').onclick = () => { setToken(''); toast('로그아웃했습니다.'); route(); }; }
+
+  async function viewWitness() {
+    let list;
+    try { list = await api('/api/witness'); } catch (e) { if (!token) return route(); throw e; }
+    info.witnessPending = list.length; renderRail('admin');
+    main.innerHTML = adminHead(`목격담 대기 ${list.length}건`, 'witness') + (list.length ? list.map(w =>
+      `<div class="card"><div class="card-h"><div><a href="${wlink(w.title)}"><b>${esc(w.title)}</b></a></div><span class="meta">${esc(w.author)} / ${fmt(w.createdAt)}</span></div>
+       <p class="wit-body">${esc(w.content)}</p>
+       <div class="reason"><label class="chk"><input type="checkbox" data-wstrike="${w.id}" checked> 거절 시 제한 점수 부과</label>
+         <button type="button" class="primary" data-wap="${w.id}">승인</button><button type="button" class="danger" data-wrj="${w.id}">거절</button></div></div>`).join('')
+      : '<div class="paper slim"><p class="empty">대기 중인 목격담이 없습니다.</p></div>');
+    bindLogout();
+    const act = (sel, key, path, getBody, msg) => $$(sel).forEach(b => b.onclick = async () => {
+      b.disabled = true;
+      try { await api(`/api/witness/${b.dataset[key]}/${path}`, { method: 'POST', body: getBody(b.dataset[key]) }); toast(msg); viewWitness(); }
+      catch (e) { b.disabled = false; toast(e.message, 'err'); if (e.status === 404) viewWitness(); }
+    });
+    act('[data-wap]', 'wap', 'approve', () => ({}), '승인했습니다.');
+    act('[data-wrj]', 'wrj', 'reject', id => ({ strike: $(`[data-wstrike="${id}"]`).checked }), '거절했습니다.');
+  }
+
+  async function viewBlocks() {
+    let list;
+    try { list = await api('/api/admin/blocks'); } catch (e) { if (!token) return route(); throw e; }
+    main.innerHTML = adminHead('제안 제한', 'blocks') +
+      `<div class="paper slim"><p class="meta">7일 안에 3번 반려(제한 점수를 부과한 경우)되면 24시간 동안 제안과 목격담을 보낼 수 없습니다. 그 뒤로 반려될 때마다 24시간씩 늘어나고 최대 7일입니다. 승인되면 점수가 1점 줄어듭니다. 접속 정보는 저장하지 않고 번호만 보여줍니다.</p>
+       ${list.length ? `<ul class="ledger">${list.map(x => `<li><div class="l"><b>${esc(x.id)}</b><span class="sum">반려 ${x.count}회</span></div><div class="r">${Math.max(1, Math.ceil((x.until - Date.now()) / 3600000))}시간 남음 <button type="button" data-rel="${esc(x.id)}">해제</button></div></li>`).join('')}</ul>` : '<p class="empty">제한 중인 접속이 없습니다.</p>'}</div>`;
+    bindLogout();
+    $$('[data-rel]').forEach(b => b.onclick = async () => {
+      try { await api('/api/admin/blocks/release', { method: 'POST', body: { id: b.dataset.rel } }); toast('해제했습니다.'); viewBlocks(); }
+      catch (e) { toast(e.message, 'err'); }
+    });
+  }
+
   function viewBackup() {
     main.innerHTML =
-      `<div class="paper slim"><div class="card-h"><h1>백업</h1>
-         <div class="row"><a class="btn" href="#/admin">대기 중</a><a class="btn" href="#/admin/done">처리 내역</a><a class="btn primary" href="#/admin/backup">백업</a><button type="button" id="logout">로그아웃</button></div></div></div>
-       <div class="paper slim"><h2 class="sec-t">문서 내려받기</h2>
+      adminHead('백업', 'backup') +
+      `       <div class="paper slim"><h2 class="sec-t">문서 내려받기</h2>
          <p class="meta">지금 올라가 있는 모든 문서를 파일 하나(JSON)로 저장합니다.</p>
          <label class="chk"><input type="checkbox" id="withRev"> 변경 기록도 포함</label>
          <div class="row mt"><button type="button" class="primary" id="dl">문서 내려받기</button></div></div>
@@ -571,7 +738,7 @@
          <p class="meta">내려받은 백업 파일을 고르면 문서를 다시 올립니다. 같은 내용의 문서는 건너뛰고, 내용이 다른 문서는 백업의 내용을 새 판으로 올립니다. 백업에 없는 문서는 건드리지 않습니다.</p>
          <input type="file" id="bf" accept=".json,application/json" aria-label="백업 파일">
          <div class="row mt"><button type="button" class="danger" id="rs">복원하기</button></div><div id="rmsg" class="mt"></div></div>`;
-    $('#logout').onclick = () => { setToken(''); toast('로그아웃했습니다.'); route(); };
+    bindLogout();
     $('#dl').onclick = async () => {
       try {
         const d = await api('/api/admin/export' + ($('#withRev').checked ? '?revisions=1' : ''));
@@ -594,8 +761,8 @@
       if (!confirm(`문서 ${n}개를 복원합니다. 계속할까요?`)) return;
       $('#rs').disabled = true;
       try {
-        const r = await api('/api/admin/import', { method: 'POST', body: { app: data.app, pages: (data.pages || []).map(p => ({ title: p.title, scare: p.scare, content: p.content })) } });
-        $('#rmsg').innerHTML = note('', `복원 ${r.imported}개, 건너뜀 ${r.skipped}개, 올바르지 않음 ${r.invalid}개`);
+        const r = await api('/api/admin/import', { method: 'POST', body: { app: data.app, pages: (data.pages || []).map(p => ({ title: p.title, scare: p.scare, content: p.content, grade: p.grade, no: p.no })), witnesses: data.witnesses || [] } });
+        $('#rmsg').innerHTML = note('', `복원 ${r.imported}개, 건너뜀 ${r.skipped}개, 올바르지 않음 ${r.invalid}개, 목격담 ${r.witnesses || 0}개`);
         await refreshPages();
       } catch (e) { $('#rmsg').innerHTML = note('err', esc(e.message)); }
       $('#rs').disabled = false;
@@ -621,14 +788,14 @@
       return;
     }
     if (tab === 'backup') return viewBackup();
+    if (tab === 'witness') return viewWitness();
+    if (tab === 'blocks') return viewBlocks();
     const done = tab === 'done';
     let list;
     try { list = await api('/api/proposals' + (done ? '?status=done' : '')); } catch (e) { if (!token) return route(); throw e; }
     if (!done) { info.pending = list.length; renderRail('admin'); }
     pageSet = new Set(pages.map(p => p.title));
-    const head =
-      `<div class="paper slim"><div class="card-h"><h1>${done ? '처리 내역' : `승인 대기 ${list.length}건`}</h1>
-       <div class="row"><a class="btn ${done ? '' : 'primary'}" href="#/admin">대기 중</a><a class="btn ${done ? 'primary' : ''}" href="#/admin/done">처리 내역</a><a class="btn" href="#/admin/backup">백업</a><button type="button" id="logout">로그아웃</button></div></div></div>`;
+    const head = adminHead(done ? '처리 내역' : `승인 대기 ${list.length}건`, done ? 'done' : 'pending');
     let body;
     if (done) {
       body = list.length ? `<div class="paper slim"><ul class="ledger">${list.map(p =>
@@ -641,7 +808,7 @@
            <div class="card-h"><div><b>${esc(p.title)}</b><span class="tag">${p.isNew ? '새 문서' : '편집'}</span> ${scareHtml(p.scare)}</div>
            <span class="meta">${esc(p.author)} / ${fmt(p.createdAt)}</span></div>
            ${p.summary ? `<p class="meta">요약: ${esc(p.summary)}</p>` : ''}
-           ${p.outdated ? note('warn', '이 제안을 보낸 뒤에 문서가 바뀌었습니다. 승인하면 지금 내용을 이 제안의 내용으로 덮어씁니다.') : ''}
+           ${p.outdated ? note('warn', `이 제안을 보낸 뒤에 문서가 바뀌었습니다. 그대로 승인하면 지금 내용을 이 제안의 내용으로 덮어씁니다.${p.baseContent != null ? ` <button type="button" class="linklike" data-merge="${p.id}">자동으로 합치기</button>` : ''}`) : ''}
            <div data-diff="${p.id}">${p.isNew ? '' : metaChange(p.curScare, p.scare)}${diffHtml(p.isNew ? '' : (p.curContent || ''), p.content)}</div>
            <details><summary>제안한 글 미리보기</summary><div class="article">${render(p.content).html}</div></details>
            <div class="editbox" data-editbox="${p.id}" hidden>
@@ -653,11 +820,11 @@
              <div class="row mt"><button type="button" class="primary" data-apedit="${p.id}">고친 내용으로 승인</button><button type="button" data-editcancel="${p.id}">고치기 취소</button></div>
            </div>
            <div class="reason"><input type="text" maxlength="200" placeholder="거절 사유 (선택, 제안한 사람에게 보입니다)" aria-label="거절 사유" data-reason="${p.id}">
-             <button type="button" class="primary" data-ap="${p.id}">그대로 승인</button><button type="button" data-editopen="${p.id}">고쳐서 승인</button><button type="button" class="danger" data-rj="${p.id}">거절</button></div>
+             <button type="button" class="primary" data-ap="${p.id}">그대로 승인</button><button type="button" data-editopen="${p.id}">고쳐서 승인</button><label class="chk"><input type="checkbox" data-strike="${p.id}" checked> 제한 점수</label><button type="button" class="danger" data-rj="${p.id}">거절</button></div>
          </div>`).join('') : '<div class="paper slim"><p class="empty">대기 중인 제안이 없습니다.</p></div>';
     }
     main.innerHTML = head + body;
-    $('#logout').onclick = () => { setToken(''); toast('로그아웃했습니다.'); route(); };
+    bindLogout();
     const act = (sel, path, getBody, okMsg, confirmMsg) => $$(sel).forEach(b => b.onclick = async () => {
       const id = b.dataset.ap || b.dataset.rj;
       if (confirmMsg && !confirm(confirmMsg)) return;
@@ -693,15 +860,25 @@
       ed(id, 'editbox').hidden = true;
       redraw(id);
     });
+    $$('[data-merge]').forEach(b => b.onclick = () => {
+      const id = b.dataset.merge, p = byId[id];
+      const m = merge3(p.baseContent || '', p.curContent || '', p.content);
+      if (!m) { toast('문서가 너무 커서 자동으로 합칠 수 없습니다.', 'err'); return; }
+      ed(id, 'etext').value = m.text;
+      ed(id, 'editbox').hidden = false;
+      redraw(id);
+      toast(m.conflicts ? `합쳤습니다. 겹치는 부분 ${m.conflicts}곳에 <<<<<<< 표시가 남아 있으니 고쳐주세요.` : '충돌 없이 합쳤습니다. 비교를 확인하고 "고친 내용으로 승인"을 누르세요.');
+    });
     $$('[data-apedit]').forEach(b => b.onclick = async () => {
       const id = b.dataset.apedit;
+      if (/^<<<<<<< /m.test(ed(id, 'etext').value) && !confirm('겹침 표시(<<<<<<<)가 아직 남아 있습니다. 그대로 승인할까요?')) return;
       b.disabled = true;
       try {
         await api(`/api/proposals/${id}/approve`, { method: 'POST', body: { content: ed(id, 'etext').value, scare: +ed(id, 'escare').value } });
         toast('고쳐서 승인했습니다.'); await refreshPages(); viewAdmin();
       } catch (e) { b.disabled = false; toast(e.message, 'err'); if (e.status === 404) viewAdmin(); }
     });
-    act('[data-rj]', 'reject', id => ({ reason: $(`[data-reason="${id}"]`).value }), '거절했습니다.', '이 제안을 거절할까요?');
+    act('[data-rj]', 'reject', id => ({ reason: $(`[data-reason="${id}"]`).value, strike: $(`[data-strike="${id}"]`).checked }), '거절했습니다.', '이 제안을 거절할까요?');
   }
 
   // ---------- 라우터 ----------
